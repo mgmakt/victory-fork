@@ -598,6 +598,20 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// What the pass over textures picked by index was blocked on since the
+/// last line (`heap_textures`), read by the texture queue probe
+/// (`VICTORY_TEXTURE_PROBE=0`: off): passes, their milliseconds, slots due
+/// when each began, textures their uploads made, slots held back because
+/// the card had no room, passes that stopped with slots still due while the
+/// card had room (the pass's own budget is what holds them), and the slots
+/// left due at the end of those passes.
+pub(crate) static HEAP_TEXTURE_BLOCKS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// Where the pass over textures picked by index starts in its queue: the
+/// slot after the one the pass before stopped at, so that a backlog larger
+/// than a pass walks in turn (`VICTORY_TEXTURE_ROTATE=0`: always the front).
+static TEXTURE_QUEUE_AT: AtomicU64 = AtomicU64::new(0);
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -1897,6 +1911,10 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let (due, census) = host.texture_slots_due(frame, 4096);
+        // The probe's view of this pass: the slots it was given, and the
+        // uploads it makes (counted by what `HEAP_TEXTURES` gains).
+        let probe_due = due.len() as u64;
+        let probe_uploads_before = HEAP_TEXTURES.load(Ordering::Relaxed);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1915,6 +1933,18 @@ impl State {
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
         let most = (4000 / took).clamp(16, 256);
+        // The bytes a pass may stage are a rate at sixty frames a second. A
+        // frame heavy in draws lasts three to six of those, and at a flat
+        // budget the textures would then move a third to a sixth of that
+        // rate while they wait behind the frame's own drawing: the budget
+        // grows with the frame's length instead, up to four times, and the
+        // pass's time budget (`span`) still bounds it
+        // (`VICTORY_TEXTURE_RATE_SCALE=0`: the flat budget, as before).
+        let per_frame = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let on = *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RATE_SCALE").is_none_or(|v| v != "0"));
+            if on { per_frame.saturating_mul(took.clamp(17, 66)) / 17 } else { per_frame }
+        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -1950,7 +1980,24 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
-        for (index, write) in due {
+        // Where the pass starts in the queue: after the slot the last one
+        // stopped at, so that a backlog the budget cuts short is walked in
+        // turn instead of its front being looked at again every pass
+        // (`VICTORY_TEXTURE_ROTATE=0`: from the front, as before).
+        let skip = {
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            let on = *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROTATE").is_none_or(|v| v != "0"));
+            let at = TEXTURE_QUEUE_AT.load(Ordering::Relaxed);
+            if on && !due.is_empty() { (at % due.len() as u64) as usize } else { 0 }
+        };
+        let order: Vec<(u32, u64)> = {
+            let mut order = due;
+            order.rotate_left(skip);
+            order
+        };
+        let mut looked = 0usize;
+        for (index, write) in order {
+            looked += 1;
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
             }
@@ -2154,6 +2201,66 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        // The texture queue probe: what this pass was blocked on, and a line
+        // every five seconds saying whether the textures wait behind the
+        // card's room, behind the pass's own budget, or on nothing.
+        TEXTURE_QUEUE_AT.store(skip as u64 + looked as u64, Ordering::Relaxed);
+        let probe_uploads = HEAP_TEXTURES.load(Ordering::Relaxed).saturating_sub(probe_uploads_before);
+        let probe_left = probe_due.saturating_sub(probe_uploads);
+        let probe_ms = began.elapsed().as_millis() as u64;
+        HEAP_TEXTURE_BLOCKS[0].fetch_add(1, Ordering::Relaxed);
+        HEAP_TEXTURE_BLOCKS[1].fetch_add(probe_ms, Ordering::Relaxed);
+        HEAP_TEXTURE_BLOCKS[2].fetch_add(probe_due, Ordering::Relaxed);
+        HEAP_TEXTURE_BLOCKS[3].fetch_add(probe_uploads, Ordering::Relaxed);
+        HEAP_TEXTURE_BLOCKS[4].fetch_add(refused as u64, Ordering::Relaxed);
+        if probe_left > 0 {
+            // Stopped with slots still due: the pass's own bytes or time
+            // budget, or the card's room (counted apart above).
+            HEAP_TEXTURE_BLOCKS[5].fetch_add(u64::from(room), Ordering::Relaxed);
+            HEAP_TEXTURE_BLOCKS[6].fetch_add(probe_left, Ordering::Relaxed);
+        }
+        Self::texture_queue_line(room);
+    }
+
+    /// One line every five seconds of what the pass over textures picked by
+    /// index was blocked on (`VICTORY_TEXTURE_PROBE=0` turns it off): the
+    /// passes and their time, the slots due and the uploads made, the slots
+    /// held back while the card had no room, and the passes that stopped
+    /// with slots still due although the card had room — those are textures
+    /// waiting on the layer's own budget, not on the card.
+    fn texture_queue_line(room: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PROBE").is_none_or(|v| v != "0")) {
+            return;
+        }
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        let last = LAST.load(Relaxed);
+        if now.saturating_sub(last) < 5000 {
+            return;
+        }
+        if LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+            return;
+        }
+        // The window's counts, then zero: the line covers the seconds since
+        // the one before.
+        let mut counts = [0u64; 7];
+        for (count, slot) in HEAP_TEXTURE_BLOCKS.iter().zip(counts.iter_mut()) {
+            *slot = count.swap(0, Relaxed);
+        }
+        let [passes, ms, due, uploaded, held, stopped, left] = counts;
+        tracing::info!(
+            passes,
+            ms_in_them = ms,
+            due,
+            uploaded,
+            held_for_room = held,
+            stopped_with_slots_due = stopped,
+            slots_left_due = left,
+            room,
+            "texture queue probe"
+        );
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
